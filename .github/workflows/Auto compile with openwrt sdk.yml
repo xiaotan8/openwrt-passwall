@@ -73,7 +73,7 @@ jobs:
     name: Build passwall [Luci ${{ matrix.luci_ver }}]
     needs: job_check
     if: needs.job_check.outputs.has_update == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -88,7 +88,7 @@ jobs:
     steps:
       - name: Install packages
         run: |
-          ##docker rmi `docker images -q`
+          docker rmi `docker images -q`
           sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
           echo "Install packages"
           sudo -E apt-get -qq update
@@ -166,7 +166,7 @@ jobs:
   job_auto_compile:
     if: ${{ needs.job_check.outputs.has_update == 'true' && needs.job_check.outputs.prerelease == 'false' }}
     needs: job_check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     name: build (${{ matrix.platform }})
     strategy:
       fail-fast: false

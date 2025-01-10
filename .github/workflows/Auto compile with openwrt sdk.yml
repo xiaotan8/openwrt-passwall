@@ -20,7 +20,7 @@ env:
 jobs:
   job_check:
     name: Check Version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       passwall_version: ${{ steps.check_version.outputs.latest_version }}
       has_update: ${{ steps.check_version.outputs.has_update }}

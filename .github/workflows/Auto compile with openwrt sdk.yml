@@ -1,7 +1,11 @@
 name: OpenWrt SNAPSHOT APK Build
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:

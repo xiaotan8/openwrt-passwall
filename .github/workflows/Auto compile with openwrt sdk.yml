@@ -1,66 +1,81 @@
-name: Build OpenWrt SNAPSHOT APK
+name: Test Build
 
 on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+  pull_request:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    env:
-      DEBIAN_FRONTEND: noninteractive
+    name: Test ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86-64
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
-      
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Update and install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential clang libc6-dev-i386 libc6-x32 libc6-dev-x32 \
-          gcc-multilib g++-multilib \
-          python3 python3-venv python3-pip python3-setuptools python3-distutils-extra \
-          curl wget tar xz-utils git
+      - name: Determine branch name
+        run: |
+          BRANCH="${GITHUB_BASE_REF#refs/heads/}"
+          echo "Building for $BRANCH"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
 
-    - name: Install static apk-tools
-      run: |
-        APK_VER="2.14.3-r0"
-        APK_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-$APK_VER.apk"
-        curl -sSL $APK_URL -o apk-tools-static.apk
-        mkdir -p apk-tools-static
-        tar -xzf apk-tools-static.apk -C apk-tools-static
-        sudo cp apk-tools-static/sbin/apk.static /usr/local/bin/apk
-        chmod +x /usr/local/bin/apk
+      - name: Determine changed packages
+        run: |
+          PKG_ROOTS=$(find . -name Makefile | \
+            grep -v ".*/src/Makefile" | \
+            sed -e 's@./\(.*\)/Makefile@\1/@')
+          CHANGES=$(git diff --diff-filter=d --name-only origin/$BRANCH)
 
-    - name: Verify environment
-      run: |
-        python3 --version
-        apk --version
+          for ROOT in $PKG_ROOTS; do
+            for CHANGE in $CHANGES; do
+              if [[ "$CHANGE" == "$ROOT"* ]]; then
+                PACKAGES+=$(echo "$ROOT" | sed -e 's@.*/\(.*\)/@\1 @')
+                break
+              fi
+            done
+          done
 
-    - name: Clone OpenWrt SNAPSHOT
-      run: |
-        git clone https://github.com/openwrt/openwrt.git
-        cd openwrt
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+          PACKAGES="${PACKAGES:-luci-app-attendedsysupgrade}"
+          echo "Building $PACKAGES"
+          echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
 
-    - name: Prepare OpenWrt build
-      run: |
-        cd openwrt
-        make defconfig
+      - name: Install apk-tools-static
+        run: |
+          APK_VER="2.14.3-r0"
+          APK_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-$APK_VER.apk"
+          curl -sSL $APK_URL -o apk-tools-static.apk
+          mkdir -p apk-tools-static
+          tar -xf apk-tools-static.apk -C apk-tools-static
+          sudo cp apk-tools-static/sbin/apk.static /usr/local/bin/apk
+          chmod +x /usr/local/bin/apk
+          apk --version
 
-    - name: Build OpenWrt APK packages
-      run: |
-        cd openwrt
-        # 如果你要单独打包特定插件，可以替换下面的 target
-        make package/<your-package>/compile V=s
+      - name: Build
+        uses: openwrt/gh-action-sdk@v7
+        env:
+          ARCH: ${{ matrix.arch }}-${{ env.BRANCH }}
+          FEEDNAME: packages_ci
+          V: s
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: openwrt-apk
-        path: openwrt/bin/packages
+      - name: Move created packages to project dir
+        run: cp bin/packages/${{ matrix.arch }}/packages_ci/* . || true
+
+      - name: Store packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-packages
+          path: |
+            *.ipk
+            *.apk
+
+      - name: Store logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-logs
+          path: logs/

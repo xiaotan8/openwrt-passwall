@@ -1,125 +1,65 @@
-name: Build Passwall SNAPSHOT APK
+name: Build OpenWrt SNAPSHOT APK
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
-  build_passwall:
-    runs-on: ubuntu-latest
-#!/usr/bin/env bash
-set -e
-
-echo "==> 更新 apt 仓库"
-sudo apt-get update
-
-echo "==> 安装基础构建工具和 Python 依赖"
-sudo apt-get install -y \
-    build-essential clang libc6-dev-i386 libc6-x32 libc6-dev-x32 \
-    gcc-multilib g++-multilib \
-    python3 python3-venv python3-pip python3-setuptools python3-distutils-extra \
-    curl wget tar xz-utils git
-
-echo "==> 安装 apk-tools (Alpine Package Keeper) 静态二进制"
-APK_VER="2.14.3-r0"
-APK_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-$APK_VER.apk"
-curl -sSL $APK_URL -o apk-tools-static.apk
-mkdir -p apk-tools-static
-tar -xzf apk-tools-static.apk -C apk-tools-static
-sudo cp apk-tools-static/sbin/apk.static /usr/local/bin/apk
-chmod +x /usr/local/bin/apk
-
-echo "==> 验证安装"
-python3 --version
-apk --version
-
-echo "✅ 所有依赖安装完成，Python 与 apk-tools 已准备好"
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [x86/64]   # 这里可扩展多个 SNAPSHOT 平台
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Install dependencies
-        run: |
-            sudo apt-get update
-            sudo apt-get install -y build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-            rsync unzip zlib1g-dev file wget curl fakeroot
+    - name: Update and install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang libc6-dev-i386 libc6-x32 libc6-dev-x32 \
+          gcc-multilib g++-multilib \
+          python3 python3-venv python3-pip python3-setuptools python3-distutils-extra \
+          curl wget tar xz-utils git
 
-            # Python 模块 (替代 python3-distutils)
-            sudo apt-get install -y python3-stdlib-extensions
+    - name: Install static apk-tools
+      run: |
+        APK_VER="2.14.3-r0"
+        APK_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-$APK_VER.apk"
+        curl -sSL $APK_URL -o apk-tools-static.apk
+        mkdir -p apk-tools-static
+        tar -xzf apk-tools-static.apk -C apk-tools-static
+        sudo cp apk-tools-static/sbin/apk.static /usr/local/bin/apk
+        chmod +x /usr/local/bin/apk
 
-            # 安装 apk-tools (Alpine)
-            curl -sSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-2.14.3-r0.apk -o apk-tools-static.apk
-            tar -xzf apk-tools-static.apk
-            sudo cp sbin/apk.static /usr/local/bin/apk
-    
-            # Alpine 构建环境
-            sudo apt-get install -y fakeroot sudo
-            sudo apk add --no-cache alpine-sdk || true
+    - name: Verify environment
+      run: |
+        python3 --version
+        apk --version
 
-      - name: Download SNAPSHOT SDK
-        run: |
-          sdk_url="https://downloads.openwrt.org/snapshots/targets/${{matrix.platform}}/openwrt-sdk-${{matrix.platform}}_gcc-*.tar.xz"
-          wget -qO sdk.tar.xz "$sdk_url"
-          mkdir -p sdk && tar -Jxf sdk.tar.xz -C sdk --strip-components=1
+    - name: Clone OpenWrt SNAPSHOT
+      run: |
+        git clone https://github.com/openwrt/openwrt.git
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-      - name: Prepare feeds
-        run: |
-          cd sdk
-          echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> feeds.conf.default
-          echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: Prepare OpenWrt build
+      run: |
+        cd openwrt
+        make defconfig
 
-      - name: Build passwall ipk
-        run: |
-          cd sdk
-          make defconfig
-          make package/feeds/passwall/luci-app-passwall/compile V=s
+    - name: Build OpenWrt APK packages
+      run: |
+        cd openwrt
+        # 如果你要单独打包特定插件，可以替换下面的 target
+        make package/<your-package>/compile V=s
 
-      - name: Convert ipk to apk
-        run: |
-          cd sdk/bin/packages/*/*/
-          mkdir apk_out
-          for ipk in *.ipk; do
-            echo "Converting $ipk ..."
-            workdir=$(mktemp -d)
-            cd "$workdir"
-
-            # 解包 ipk
-            ar x "$OLDPWD/$ipk"
-            tar -xzf data.tar.gz || true
-            tar -xzf control.tar.gz || true
-
-            pkgname=$(basename "$ipk" .ipk)
-
-            # 简易 APKBUILD（可改进依赖解析）
-            cat > APKBUILD <<EOF
-            pkgname=$pkgname
-            pkgver=1.0
-            pkgrel=0
-            pkgdesc="Converted from OpenWrt ipk"
-            url="https://openwrt.org/"
-            arch="all"
-            license="GPL"
-            depends=""
-            source=""
-            EOF
-
-            # 伪造 build
-            mkdir -p ~/packages/all
-            fakeroot tar -czf ~/packages/all/${pkgname}-1.0-r0.apk *
-
-            cp ~/packages/all/${pkgname}-1.0-r0.apk "$OLDPWD/apk_out/"
-            cd "$OLDPWD"
-          done
-
-      - name: Upload APK
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: snapshot-${{ matrix.platform }}
-          files: sdk/bin/packages/*/*/apk_out/*.apk
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: openwrt-apk
+        path: openwrt/bin/packages

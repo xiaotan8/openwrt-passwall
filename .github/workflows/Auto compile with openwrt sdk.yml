@@ -6,11 +6,37 @@ on:
 jobs:
   build_passwall:
     runs-on: ubuntu-latest
+#!/usr/bin/env bash
+set -e
 
+echo "==> 更新 apt 仓库"
+sudo apt-get update
+
+echo "==> 安装基础构建工具和 Python 依赖"
+sudo apt-get install -y \
+    build-essential clang libc6-dev-i386 libc6-x32 libc6-dev-x32 \
+    gcc-multilib g++-multilib \
+    python3 python3-venv python3-pip python3-setuptools python3-distutils-extra \
+    curl wget tar xz-utils git
+
+echo "==> 安装 apk-tools (Alpine Package Keeper) 静态二进制"
+APK_VER="2.14.3-r0"
+APK_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/apk-tools-static-$APK_VER.apk"
+curl -sSL $APK_URL -o apk-tools-static.apk
+mkdir -p apk-tools-static
+tar -xzf apk-tools-static.apk -C apk-tools-static
+sudo cp apk-tools-static/sbin/apk.static /usr/local/bin/apk
+chmod +x /usr/local/bin/apk
+
+echo "==> 验证安装"
+python3 --version
+apk --version
+
+echo "✅ 所有依赖安装完成，Python 与 apk-tools 已准备好"
     strategy:
       fail-fast: false
       matrix:
-        platform: [x86/64, aarch64/generic]   # 这里可扩展多个 SNAPSHOT 平台
+        platform: [x86/64]   # 这里可扩展多个 SNAPSHOT 平台
 
     steps:
       - name: Checkout

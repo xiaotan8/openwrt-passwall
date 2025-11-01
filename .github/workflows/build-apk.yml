@@ -1,0 +1,169 @@
+
+# GitHub Actions workflow: 编译 OpenWrt 单个 package（支持 passwall 源码自动克隆）并生成 .apk + packages.adb 索引
+# 说明：该 workflow 会克隆 OpenWrt 源码，并额外克隆 https://github.com/xiaorouji/openwrt-passwall.git 到 openwrt/package/community/openwrt-passwall
+# 参数可通过 workflow_dispatch 手动传入：
+# - package: 要编译的包（例如 luci-app-passwall）
+# - passwall_repo: passwall 源码仓库（默认已设为 xiaorouji/openwrt-passwall）
+# - openwrt_repo/branch: OpenWrt 源地址与分支
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: '要编译的包名或包路径（相对于 openwrt 源码根），例如 luci-app-passwall'
+        required: true
+        default: 'luci-app-passwall'
+      passwall_repo:
+        description: 'luci-app-passwall 源码仓库（将会被克隆到 openwrt/package/community）'
+        required: true
+        default: 'https://github.com/xiaorouji/openwrt-passwall.git'
+      openwrt_repo:
+        description: 'OpenWrt 源码仓库 URL'
+        required: true
+        default: 'https://git.openwrt.org/openwrt/openwrt.git'
+      openwrt_branch:
+        description: 'OpenWrt 分支（如 master 或 snapshot 分支）'
+        required: true
+        default: 'master'
+      threads:
+        description: '并行编译线程数'
+        required: true
+        default: '2'
+  push:
+    branches:
+      - main
+
+jobs:
+  build-package:
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_INPUT: ${{ github.event.inputs.package || 'luci-app-passwall' }}
+      PASSWALL_REPO: ${{ github.event.inputs.passwall_repo || 'https://github.com/xiaorouji/openwrt-passwall.git' }}
+      OPENWRT_REPO: ${{ github.event.inputs.openwrt_repo || 'https://git.openwrt.org/openwrt/openwrt.git' }}
+      OPENWRT_BRANCH: ${{ github.event.inputs.openwrt_branch || 'master' }}
+      THREADS: ${{ github.event.inputs.threads || '2' }}
+      CCACHE_DIR: ${{ runner.temp }}/ccache
+    steps:
+      - name: Checkout action repo (this package repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential libncurses5-dev gawk gettext unzip file \
+            autoconf automake libtool gcc-multilib g++-multilib subversion \
+            pkg-config libssl-dev python3 python3-distutils git wget ccache ca-certificates || true
+          ccache --version || true
+
+      - name: Prepare workspace and clone OpenWrt
+        run: |
+          mkdir -p openwrt
+          echo "Cloning OpenWrt repo: $OPENWRT_REPO @$OPENWRT_BRANCH"
+          git clone --depth 1 --branch "$OPENWRT_BRANCH" "$OPENWRT_REPO" openwrt || (cd openwrt && git fetch --depth=1 origin "$OPENWRT_BRANCH" && git checkout FETCH_HEAD)
+
+      - name: Clone passwall repo into openwrt/package/community
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          mkdir -p package/community
+          # If user supplied a passwall repo, clone it. If already exists, update it.
+          if [ -d "package/community/openwrt-passwall" ]; then
+            echo "package/community/openwrt-passwall already exists, fetching latest..."
+            (cd package/community/openwrt-passwall && git fetch --depth 1 origin || true) || true
+          else
+            echo "Cloning PASSWALL repo: $PASSWALL_REPO"
+            git clone --depth 1 "$PASSWALL_REPO" package/community/openwrt-passwall || {
+              echo "Clone failed, retry with full clone..."
+              rm -rf package/community/openwrt-passwall
+              git clone "$PASSWALL_REPO" package/community/openwrt-passwall
+            }
+          fi
+          # show files to confirm package presence
+          echo "Listing package/community/openwrt-passwall:"
+          ls -la package/community/openwrt-passwall || true
+
+      - name: Update feeds and install
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a || true
+          find package feeds -maxdepth 3 -type f -name '*Makefile' | head -n 20 || true
+
+      - name: Prepare .config (non-interactive minimal)
+        working-directory: openwrt
+        run: |
+          # 如果需要特定 TARGET/TARGET_SUBTARGET/TARGET_PROFILE，请放置 openwrt/.config 到仓库或在此处写入
+          make defconfig
+          make oldconfig || true
+
+      - name: Compile package (download/prepare/compile)
+        working-directory: openwrt
+        env:
+          MAKEFLAGS: "-j${{ env.THREADS }}"
+          CCACHE_DIR: ${{ env.CCACHE_DIR }}
+        run: |
+          set -euo pipefail
+          PKG_INPUT="${{ env.PACKAGE_INPUT }}"
+          PKG="${PKG_INPUT##*/}"
+          echo "Compiling package input: '${PKG_INPUT}' (short name: $PKG)"
+          # Ensure downloads available
+          make package/"$PKG_INPUT"/download V=s || true
+          make package/"$PKG_INPUT"/prepare V=s || true
+          if ! make package/"$PKG_INPUT"/compile V=s; then
+            echo "Fallback: try by short package name"
+            make package/"$PKG"/download V=s || true
+            make package/"$PKG"/prepare V=s || true
+            make package/"$PKG"/compile V=s
+          fi
+
+      - name: Collect artifacts (.apk/.ipk) and generate packages.adb
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          OUTDIR="$(pwd)/bin/packages"
+          ARTIFACT_DIR="$(pwd)/../artifact-output"
+          mkdir -p "$ARTIFACT_DIR"
+          # copy .apk if present, else fallback to .ipk (and keep original names)
+          found=0
+          while IFS= read -r f; do
+            found=1
+            rel=$(realpath --relative-to="$(pwd)/bin" "$f" 2>/dev/null || echo "$(basename "$f")")
+            dest="$ARTIFACT_DIR/$(basename "$f")"
+            cp -v "$f" "$dest"
+          done < <(find "$OUTDIR" -type f -name '*.apk' 2>/dev/null || true)
+          if [ "$found" -eq 0 ]; then
+            echo "No .apk found, trying .ipk fallback (will copy but keep .ipk extension)"
+            while IFS= read -r f; do
+              rel=$(realpath --relative-to="$(pwd)/bin" "$f" 2>/dev/null || echo "$(basename "$f")")
+              dest="$ARTIFACT_DIR/$(basename "$f")"
+              cp -v "$f" "$dest"
+            done < <(find "$OUTDIR" -type f -name '*.ipk' 2>/dev/null || true)
+          fi
+
+          # Build simple packages.adb index (customize fields as needed)
+          INDEX_FILE="$ARTIFACT_DIR/packages.adb"
+          echo "# packages.adb generated by CI on $(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$INDEX_FILE"
+          echo "# format: Package|Filename|Size|SHA256" >> "$INDEX_FILE"
+          find "$ARTIFACT_DIR" -maxdepth 1 -type f \( -name '*.apk' -o -name '*.ipk' \) -print0 | while IFS= read -r -d '' f; do
+            size=$(stat -c%s "$f")
+            sha=$(sha256sum "$f" | awk '{print $1}')
+            pkgname=$(basename "$f")
+            relpath="packages/$(basename "$f")"
+            printf "%s|%s|%s|%s\n" "$pkgname" "$relpath" "$size" "$sha" >> "$INDEX_FILE"
+          done
+
+          echo "Generated index at $INDEX_FILE"
+          ls -lah "$ARTIFACT_DIR" || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-apk-artifacts
+          path: openwrt/../artifact-output
+
+      - name: Print summary
+        run: |
+          echo "Build finished. Artifact archive uploaded as 'openwrt-apk-artifacts'."
+          echo "If packages.adb 需要额外字段（Version, Depends 等），请告知我，我可以生成更完整的索引脚本（解析 .ipk/.apk control 数据）。"
